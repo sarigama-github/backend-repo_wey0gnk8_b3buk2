@@ -12,15 +12,11 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Literal
+from datetime import datetime
 
-# Example schemas (replace with your own):
-
+# Example schemas (keep for reference)
 class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
     name: str = Field(..., description="Full name")
     email: str = Field(..., description="Email address")
     address: str = Field(..., description="Address")
@@ -28,18 +24,46 @@ class User(BaseModel):
     is_active: bool = Field(True, description="Whether user is active")
 
 class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
     title: str = Field(..., description="Product title")
     description: Optional[str] = Field(None, description="Product description")
     price: float = Field(..., ge=0, description="Price in dollars")
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
 
-# Add your own schemas here:
-# --------------------------------------------------
+# ---- App Schemas ----
+
+class OrderLineItem(BaseModel):
+    sku: str
+    title: str
+    qty: int = Field(..., ge=1)
+    price: float = Field(..., ge=0, description="Unit price paid by customer")
+    cost: float = Field(..., ge=0, description="Unit cost of goods")
+
+class Order(BaseModel):
+    order_id: str
+    date: datetime
+    subtotal: float = Field(..., ge=0)
+    discounts: float = Field(0, ge=0)
+    refunds: float = Field(0, ge=0)
+    shipping_revenue: float = Field(0, ge=0)
+    processing_fees: float = Field(0, ge=0)
+    line_items: List[OrderLineItem]
+
+class AdSpend(BaseModel):
+    date: datetime
+    channel: str
+    amount: float = Field(..., ge=0)
+    kind: Literal["cold", "warm", "brand", "other"] = "cold"
+
+class SubscriptionEvent(BaseModel):
+    date: datetime
+    amount: float = Field(..., ge=0, description="MRR amount delta for this event")
+    event_type: Literal["new", "expansion", "contraction", "churn", "reactivation"]
+
+class COGS(BaseModel):
+    sku: str
+    cost: float = Field(..., ge=0)
+    effective_date: datetime
 
 # Note: The Flames database viewer will automatically:
 # 1. Read these schemas from GET /schema endpoint
