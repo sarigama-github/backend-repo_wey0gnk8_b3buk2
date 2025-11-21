@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -367,6 +367,216 @@ def seed_demo(cfg: SeedConfig):
                 db["subscriptionevent"].insert_one({"date": d, "amount": round(abs(delta), 2), "event_type": "churn", "market": m})
 
     return {"status": "ok", "seeded_days": cfg.days, "markets": MARKETS}
+
+
+# ----- Observations (AI CFO) -----
+class ObservationsResponse(BaseModel):
+    range: Dict[str, str]
+    market: Optional[str] = None
+    observations: List[Dict[str, Any]]
+    facebook: List[Dict[str, Any]]
+    shopify: List[Dict[str, Any]]
+    per_market: Dict[str, Dict[str, Any]]
+
+
+def _sum_days(days: List[Dict[str, Any]]) -> Dict[str, float]:
+    return {
+        "revenue": sum(d.get("revenue", 0.0) for d in days),
+        "orders": sum(d.get("orders", 0) for d in days),
+        "ad_spend": sum(d.get("ad_spend", 0.0) for d in days),
+        "cogs": sum(d.get("cogs", 0.0) for d in days),
+        "processing_fees": sum(d.get("processing_fees", 0.0) for d in days),
+        "profit": sum(d.get("profit", 0.0) for d in days),
+    }
+
+
+def _calc_ratios(t: Dict[str, float], meta_spend: float = 0.0) -> Dict[str, float]:
+    revenue = t.get("revenue", 0.0) or 0.0
+    orders = t.get("orders", 0) or 0
+    ad_spend = t.get("ad_spend", 0.0) or 0.0
+    cogs = t.get("cogs", 0.0) or 0.0
+    fees = t.get("processing_fees", 0.0) or 0.0
+    ratios = {
+        "aov": (revenue / orders) if orders else 0.0,
+        "gross_margin_pct": ((revenue - cogs) / revenue * 100.0) if revenue else 0.0,
+        "fee_pct": (fees / revenue * 100.0) if revenue else 0.0,
+        "mer": (revenue / ad_spend) if ad_spend else 0.0,  # blended ROAS/MER
+        "cpa": (ad_spend / orders) if orders else 0.0,
+        "cpa_meta": (meta_spend / orders) if orders else 0.0,
+    }
+    return ratios
+
+
+def _ad_spend_breakdown(start_date: datetime, end_date: datetime, market: Optional[str]) -> Dict[str, float]:
+    query = {"date": {"$gte": start_of_day(start_date), "$lte": end_of_day(end_date)}}
+    if market:
+        query["market"] = market
+    spends = list(db["adspend"].find(query)) if db else []
+    out: Dict[str, float] = {}
+    for s in spends:
+        ch = (s.get("channel") or "other").lower()
+        out[ch] = out.get(ch, 0.0) + float(s.get("amount", 0))
+    return out
+
+
+@app.get("/api/observations")
+def observations(
+    start: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    market: Optional[str] = Query(None, description="Filter by market"),
+):
+    """AI CFO observations across Facebook and Shopify, per market and global, for n8n integration."""
+    today = datetime.now(timezone.utc)
+    end_date = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc) if end else today
+    start_date = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc) if start else end_date - timedelta(days=6)
+
+    # Per-market rollups
+    markets = list_markets()
+    per_market: Dict[str, Dict[str, Any]] = {}
+    for mkt in markets:
+        days = aggregate_daily_metrics(start_date, end_date, mkt)
+        totals = _sum_days(days)
+        ch = _ad_spend_breakdown(start_date, end_date, mkt)
+        meta_spend = ch.get("meta", 0.0)
+        ratios = _calc_ratios(totals, meta_spend)
+        per_market[mkt] = {**totals, **ratios, "meta_spend": meta_spend, "channel_spend": ch}
+
+    # Global/selected market
+    if market:
+        sel_days = aggregate_daily_metrics(start_date, end_date, market)
+        sel_totals = _sum_days(sel_days)
+        sel_channels = _ad_spend_breakdown(start_date, end_date, market)
+        sel_meta = sel_channels.get("meta", 0.0)
+        sel_ratios = _calc_ratios(sel_totals, sel_meta)
+        current = {**sel_totals, **sel_ratios, "meta_spend": sel_meta, "channel_spend": sel_channels}
+    else:
+        # Global totals across all markets
+        glob_days = aggregate_daily_metrics(start_date, end_date, None)
+        glob_totals = _sum_days(glob_days)
+        glob_channels = _ad_spend_breakdown(start_date, end_date, None)
+        glob_meta = glob_channels.get("meta", 0.0)
+        glob_ratios = _calc_ratios(glob_totals, glob_meta)
+        current = {**glob_totals, **glob_ratios, "meta_spend": glob_meta, "channel_spend": glob_channels}
+
+    # Rankings
+    by_revenue = sorted(per_market.items(), key=lambda kv: kv[1].get("revenue", 0.0), reverse=True)
+    by_profit = sorted(per_market.items(), key=lambda kv: kv[1].get("profit", 0.0), reverse=True)
+    top_rev_market, top_rev_val = (by_revenue[0][0], by_revenue[0][1]["revenue"]) if by_revenue else (None, 0.0)
+    top_profit_market, top_profit_val = (by_profit[0][0], by_profit[0][1]["profit"]) if by_profit else (None, 0.0)
+
+    # Benchmarks
+    AOV_TARGET = 70.0
+    GM_TARGET = 80.0
+    FEES_TARGET = 5.0
+    CPA_META_TARGET = 50.0
+
+    # Build Shopify (e-commerce) observations
+    shopify_obs: List[Dict[str, Any]] = []
+    if top_rev_market:
+        shopify_obs.append({
+            "type": "revenue_leader",
+            "severity": "info",
+            "message": f"{top_rev_market} is the top revenue market (${top_rev_val:,.0f}). Consider prioritizing inventory and ops here.",
+            "market": top_rev_market,
+        })
+    if top_profit_market:
+        shopify_obs.append({
+            "type": "profit_leader",
+            "severity": "info",
+            "message": f"{top_profit_market} leads profit (${top_profit_val:,.0f}). Allocate scale budget where margin is strongest.",
+            "market": top_profit_market,
+        })
+
+    # Compare AOV and margin against global average
+    if per_market:
+        avg_aov = sum(v.get("aov", 0.0) for v in per_market.values()) / max(len(per_market), 1)
+        avg_gm = sum(v.get("gross_margin_pct", 0.0) for v in per_market.values()) / max(len(per_market), 1)
+        for mkt, vs in per_market.items():
+            if vs.get("aov", 0) >= avg_aov * 1.15:
+                shopify_obs.append({
+                    "type": "high_aov",
+                    "severity": "info",
+                    "message": f"AOV in {mkt} is {((vs['aov']/avg_aov-1)*100):.0f}% above the average. Double down on bundles and upsells.",
+                    "market": mkt,
+                })
+            if vs.get("gross_margin_pct", 0) < GM_TARGET:
+                shopify_obs.append({
+                    "type": "low_margin",
+                    "severity": "warning",
+                    "message": f"Gross margin in {mkt} is {vs['gross_margin_pct']:.1f}% (< {GM_TARGET}%). Renegotiate COGS or adjust pricing.",
+                    "market": mkt,
+                })
+            if vs.get("fee_pct", 0) > FEES_TARGET:
+                shopify_obs.append({
+                    "type": "high_processing_fees",
+                    "severity": "warning",
+                    "message": f"Processing fees in {mkt} are {vs['fee_pct']:.1f}% (> {FEES_TARGET}%). Optimize gateway rates.",
+                    "market": mkt,
+                })
+
+    # Facebook observations (spend share, CAC, MER)
+    facebook_obs: List[Dict[str, Any]] = []
+    for mkt, vs in per_market.items():
+        meta_spend = vs.get("meta_spend", 0.0)
+        total_spend = vs.get("ad_spend", 0.0)
+        orders = vs.get("orders", 0) or 0
+        cpa_meta = (meta_spend / orders) if orders else 0.0
+        mer = vs.get("mer", 0.0)
+        spend_share = (meta_spend / total_spend * 100.0) if total_spend else 0.0
+        if meta_spend > 0:
+            msg = f"{mkt}: Meta spend ${meta_spend:,.0f} ({spend_share:.0f}% of spend), CAC ${cpa_meta:.0f}, MER {mer:.2f}."
+            sev = "info"
+            if cpa_meta > CPA_META_TARGET:
+                sev = "warning"
+                msg += " CAC above target — iterate creatives/audiences."
+            elif mer >= 3:
+                sev = "success"
+                msg += " Strong MER — consider scaling budget."
+            facebook_obs.append({"type": "meta_market", "severity": sev, "message": msg, "market": mkt})
+
+    # Consolidated top-level observations
+    consolidated: List[Dict[str, Any]] = []
+    if current.get("aov", 0) >= AOV_TARGET:
+        consolidated.append({"type": "aov_ok", "severity": "success", "message": f"AOV is healthy at ${current['aov']:.0f}."})
+    else:
+        consolidated.append({"type": "aov_low", "severity": "warning", "message": f"AOV below target (${current['aov']:.0f} < ${AOV_TARGET:.0f}). Test bundles, tiered pricing, and post-purchase upsells."})
+
+    if current.get("gross_margin_pct", 0) >= GM_TARGET:
+        consolidated.append({"type": "margin_ok", "severity": "success", "message": f"Gross margin {current['gross_margin_pct']:.0f}% meets target."})
+    else:
+        consolidated.append({"type": "margin_low", "severity": "warning", "message": f"Gross margin {current['gross_margin_pct']:.0f}% below {GM_TARGET}%. Review COGS, discounts, and pricing."})
+
+    if current.get("fee_pct", 0) <= FEES_TARGET:
+        consolidated.append({"type": "fees_ok", "severity": "success", "message": f"Processing fees {current['fee_pct']:.1f}% within guardrail."})
+    else:
+        consolidated.append({"type": "fees_high", "severity": "warning", "message": f"Processing fees {current['fee_pct']:.1f}% exceed {FEES_TARGET}%. Consider better rates or mix."})
+
+    # Return payload friendly for n8n
+    payload = {
+        "range": {"start": start_date.strftime("%Y-%m-%d"), "end": end_date.strftime("%Y-%m-%d")},
+        "market": market,
+        "observations": consolidated,
+        "facebook": facebook_obs,
+        "shopify": shopify_obs,
+        "per_market": {
+            mkt: {
+                "revenue": round(v.get("revenue", 0.0), 2),
+                "orders": int(v.get("orders", 0)),
+                "ad_spend": round(v.get("ad_spend", 0.0), 2),
+                "meta_spend": round(v.get("meta_spend", 0.0), 2),
+                "profit": round(v.get("profit", 0.0), 2),
+                "aov": round(v.get("aov", 0.0), 2),
+                "gross_margin_pct": round(v.get("gross_margin_pct", 2), 2),
+                "fee_pct": round(v.get("fee_pct", 2), 2),
+                "mer": round(v.get("mer", 0.0), 2),
+                "cpa": round(v.get("cpa", 0.0), 2),
+                "cpa_meta": round(v.get("cpa_meta", 0.0), 2),
+                "channel_spend": v.get("channel_spend", {}),
+            }
+            for mkt, v in per_market.items()
+        },
+    }
+    return payload
 
 
 if __name__ == "__main__":
