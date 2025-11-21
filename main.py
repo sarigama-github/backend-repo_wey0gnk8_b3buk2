@@ -19,10 +19,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MARKETS = [
+    "USA",
+    "UK",
+    "Australia",
+    "New Zealand",
+    "Singapore",
+    "Canada",
+    "Ireland",
+]
+
 
 @app.get("/")
 def read_root():
     return {"message": "Profit Tracker API running"}
+
+
+@app.get("/api/markets")
+def list_markets():
+    """Return known markets. If DB has distinct markets, use them; otherwise default list."""
+    try:
+        markets = set()
+        if db is not None:
+            for col in ["order", "adspend", "subscriptionevent"]:
+                try:
+                    markets.update([m for m in db[col].distinct("market") if m])
+                except Exception:
+                    pass
+        if markets:
+            return sorted(markets)
+    except Exception:
+        pass
+    return MARKETS
 
 
 # ----- Ingestion Endpoints -----
@@ -61,7 +89,8 @@ def create_cogs(cogs: COGS):
 # ----- Metrics Helpers -----
 
 def daterange(start_date: datetime, end_date: datetime):
-    cur = start_date
+    cur = start_of_day(start_date)
+    end_date = start_of_day(end_date)
     while cur <= end_date:
         yield cur
         cur += timedelta(days=1)
@@ -77,9 +106,9 @@ def end_of_day(dt: datetime) -> datetime:
     return sod + timedelta(days=1) - timedelta(microseconds=1)
 
 
-def aggregate_daily_metrics(start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
+def aggregate_daily_metrics(start_date: datetime, end_date: datetime, market: Optional[str] = None) -> List[Dict[str, Any]]:
     # Build base map for all days
-    days = {}
+    days: Dict[str, Dict[str, Any]] = {}
     for d in daterange(start_of_day(start_date), start_of_day(end_date)):
         key = d.strftime("%Y-%m-%d")
         days[key] = {
@@ -92,10 +121,12 @@ def aggregate_daily_metrics(start_date: datetime, end_date: datetime) -> List[Di
             "profit": 0.0,
         }
 
+    query_base = {"date": {"$gte": start_of_day(start_date), "$lte": end_of_day(end_date)}}
+    if market:
+        query_base["market"] = market
+
     # Orders
-    orders = list(db["order"].find({
-        "date": {"$gte": start_of_day(start_date), "$lte": end_of_day(end_date)}
-    })) if db else []
+    orders = list(db["order"].find(query_base)) if db else []
 
     for o in orders:
         day = o["date"].astimezone(timezone.utc).strftime("%Y-%m-%d")
@@ -106,21 +137,21 @@ def aggregate_daily_metrics(start_date: datetime, end_date: datetime) -> List[Di
             qty = int(li.get("qty", 0))
             cost = float(li.get("cost", 0))
             cogs_sum += qty * cost
-        days[day]["revenue"] += max(revenue_net, 0.0)
-        days[day]["orders"] += 1
-        days[day]["cogs"] += cogs_sum
-        days[day]["processing_fees"] += fees
+        if day in days:
+            days[day]["revenue"] += max(revenue_net, 0.0)
+            days[day]["orders"] += 1
+            days[day]["cogs"] += cogs_sum
+            days[day]["processing_fees"] += fees
 
     # Ad Spend
-    spends = list(db["adspend"].find({
-        "date": {"$gte": start_of_day(start_date), "$lte": end_of_day(end_date)}
-    })) if db else []
+    spends = list(db["adspend"].find(query_base)) if db else []
     for s in spends:
         day = s["date"].astimezone(timezone.utc).strftime("%Y-%m-%d")
-        days[day]["ad_spend"] += float(s.get("amount", 0))
+        if day in days:
+            days[day]["ad_spend"] += float(s.get("amount", 0))
 
     # Profit
-    for k, v in days.items():
+    for v in days.values():
         v["profit"] = v["revenue"] - v["cogs"] - v["processing_fees"] - v["ad_spend"]
 
     # Return in order
@@ -128,16 +159,18 @@ def aggregate_daily_metrics(start_date: datetime, end_date: datetime) -> List[Di
     return out
 
 
-def compute_daily_mrr(start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
+def compute_daily_mrr(start_date: datetime, end_date: datetime, market: Optional[str] = None) -> List[Dict[str, Any]]:
     """Compute daily MRR run-rate using subscription events as deltas."""
-    days = {}
+    days: Dict[str, Dict[str, Any]] = {}
     for d in daterange(start_of_day(start_date), start_of_day(end_date)):
         key = d.strftime("%Y-%m-%d")
         days[key] = {"date": key, "mrr": 0.0, "net_new_mrr": 0.0}
 
-    events = list(db["subscriptionevent"].find({
-        "date": {"$lte": end_of_day(end_date)}
-    })) if db else []
+    query = {"date": {"$lte": end_of_day(end_date)}}
+    if market:
+        query["market"] = market
+
+    events = list(db["subscriptionevent"].find(query)) if db else []
 
     # Sort events by date
     events.sort(key=lambda e: e["date"])  # UTC aware
@@ -175,13 +208,14 @@ def compute_daily_mrr(start_date: datetime, end_date: datetime) -> List[Dict[str
 def daily_summary(
     start: Optional[str] = Query(None, description="YYYY-MM-DD"),
     end: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    market: Optional[str] = Query(None, description="Filter by market"),
 ):
     """Daily revenue, ad spend, COGS, processing fees, profit"""
     today = datetime.now(timezone.utc)
     end_date = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc) if end else today
     start_date = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc) if start else end_date - timedelta(days=6)
 
-    data = aggregate_daily_metrics(start_date, end_date)
+    data = aggregate_daily_metrics(start_date, end_date, market)
     totals = {
         "revenue": round(sum(d["revenue"] for d in data), 2),
         "orders": sum(d["orders"] for d in data),
@@ -194,12 +228,12 @@ def daily_summary(
 
 
 @app.get("/api/mrr-forecast")
-def mrr_forecast(days_ahead: int = 60):
+def mrr_forecast(days_ahead: int = 60, market: Optional[str] = Query(None, description="Filter by market")):
     """Forecast MRR using average net-new MRR from last 30 days as simple trend."""
     today = datetime.now(timezone.utc)
     lookback_start = today - timedelta(days=60)
 
-    hist = compute_daily_mrr(lookback_start, today)
+    hist = compute_daily_mrr(lookback_start, today, market)
     if len(hist) == 0:
         return {"today_mrr": 0.0, "daily_net_new_avg": 0.0, "forecast": []}
 
@@ -267,70 +301,72 @@ def seed_demo(cfg: SeedConfig):
 
     import random
 
-    # Seed orders, cogs derived from line items
+    # Seed per-market data for each day
     for i, d in enumerate(daterange(start_day, datetime.now(timezone.utc))):
-        # Randomize around base values
-        rev = max(0, random.gauss(cfg.base_revenue, cfg.base_revenue * 0.15))
-        orders = max(1, int(random.gauss(cfg.base_orders, cfg.base_orders * 0.2)))
-        discounts = rev * random.uniform(0.05, 0.15)
-        refunds = rev * random.uniform(0.00, 0.05)
-        ship_rev = rev * random.uniform(0.02, 0.06)
-        fees = rev * cfg.base_fees_rate
-        # derive line items
-        avg_items_per_order = random.uniform(1.1, 1.8)
-        items = int(orders * avg_items_per_order)
-        cogs_rate = random.uniform(cfg.base_cogs_rate * 0.9, cfg.base_cogs_rate * 1.1)
-        # create one order per 10 orders to keep doc count reasonable
-        chunk = max(1, orders // 10)
-        for j in range(chunk):
-            li_count = max(1, items // chunk)
-            line_items = []
-            for k in range(li_count):
-                price = max(5.0, rev / items)
-                unit_cost = price * cogs_rate * random.uniform(0.9, 1.1)
-                line_items.append({
-                    "sku": f"SKU-{k%8}",
-                    "title": f"Product {k%8}",
-                    "qty": 1,
-                    "price": round(price, 2),
-                    "cost": round(unit_cost, 2)
+        for m in MARKETS:
+            # Randomize around base values, with small market factor
+            market_factor = random.uniform(0.7, 1.2)
+            rev = max(0, random.gauss(cfg.base_revenue, cfg.base_revenue * 0.15)) * market_factor
+            orders = max(1, int(random.gauss(cfg.base_orders, cfg.base_orders * 0.2) * market_factor))
+            discounts = rev * random.uniform(0.05, 0.15)
+            refunds = rev * random.uniform(0.00, 0.05)
+            ship_rev = rev * random.uniform(0.02, 0.06)
+            fees = rev * cfg.base_fees_rate
+            # derive line items
+            avg_items_per_order = random.uniform(1.1, 1.8)
+            items = max(1, int(orders * avg_items_per_order))
+            cogs_rate = random.uniform(cfg.base_cogs_rate * 0.9, cfg.base_cogs_rate * 1.1)
+            # create one order doc per ~10 orders to keep doc count reasonable
+            chunk = max(1, orders // 10)
+            for j in range(chunk):
+                li_count = max(1, items // chunk)
+                line_items = []
+                for k in range(li_count):
+                    price = max(5.0, rev / items)
+                    unit_cost = price * cogs_rate * random.uniform(0.9, 1.1)
+                    line_items.append({
+                        "sku": f"SKU-{k%8}",
+                        "title": f"Product {k%8}",
+                        "qty": 1,
+                        "price": round(price, 2),
+                        "cost": round(unit_cost, 2)
+                    })
+                order_doc = {
+                    "order_id": f"{m[:2].upper()}-{i}-O{j}",
+                    "date": d,
+                    "subtotal": round(rev, 2),
+                    "discounts": round(discounts, 2),
+                    "refunds": round(refunds, 2),
+                    "shipping_revenue": round(ship_rev, 2),
+                    "processing_fees": round(fees, 2),
+                    "line_items": line_items,
+                    "market": m,
+                }
+                db["order"].insert_one(order_doc)
+
+            # Ad spend per market
+            ad_spend = max(0, random.gauss(cfg.base_ad_spend, cfg.base_ad_spend * 0.2)) * market_factor
+            db["adspend"].insert_many([
+                {"date": d, "channel": "meta", "amount": round(ad_spend * 0.6, 2), "kind": "cold", "market": m},
+                {"date": d, "channel": "google", "amount": round(ad_spend * 0.4, 2), "kind": "warm", "market": m},
+            ])
+
+            # Subscription events per market to reach start_mrr proportionally
+            if i == 0:
+                start_share = cfg.start_mrr / len(MARKETS)
+                db["subscriptionevent"].insert_one({
+                    "date": d,
+                    "amount": float(start_share),
+                    "event_type": "reactivation",
+                    "market": m,
                 })
-            order_doc = {
-                "order_id": f"D{i}-O{j}",
-                "date": d,
-                "subtotal": round(rev, 2),
-                "discounts": round(discounts, 2),
-                "refunds": round(refunds, 2),
-                "shipping_revenue": round(ship_rev, 2),
-                "processing_fees": round(fees, 2),
-                "line_items": line_items,
-            }
-            db["order"].insert_one(order_doc)
+            delta = random.gauss(cfg.avg_net_new_mrr_per_day, abs(cfg.avg_net_new_mrr_per_day) * 0.5) * random.uniform(0.6, 1.4)
+            if delta >= 0:
+                db["subscriptionevent"].insert_one({"date": d, "amount": round(abs(delta), 2), "event_type": "new", "market": m})
+            else:
+                db["subscriptionevent"].insert_one({"date": d, "amount": round(abs(delta), 2), "event_type": "churn", "market": m})
 
-        # Ad spend
-        ad_spend = max(0, random.gauss(cfg.base_ad_spend, cfg.base_ad_spend * 0.2))
-        db["adspend"].insert_many([
-            {"date": d, "channel": "meta", "amount": round(ad_spend * 0.6, 2), "kind": "cold"},
-            {"date": d, "channel": "google", "amount": round(ad_spend * 0.4, 2), "kind": "warm"},
-        ])
-
-    # Seed subscription events to reach start_mrr then add daily net new
-    # Establish starting MRR at first day
-    first_day = start_day
-    db["subscriptionevent"].insert_one({
-        "date": first_day,
-        "amount": float(cfg.start_mrr),
-        "event_type": "reactivation"
-    })
-    for d in daterange(first_day, datetime.now(timezone.utc)):
-        delta = random.gauss(cfg.avg_net_new_mrr_per_day, abs(cfg.avg_net_new_mrr_per_day) * 0.5)
-        # Randomly split delta into components
-        if delta >= 0:
-            db["subscriptionevent"].insert_one({"date": d, "amount": round(abs(delta), 2), "event_type": "new"})
-        else:
-            db["subscriptionevent"].insert_one({"date": d, "amount": round(abs(delta), 2), "event_type": "churn"})
-
-    return {"status": "ok", "seeded_days": cfg.days}
+    return {"status": "ok", "seeded_days": cfg.days, "markets": MARKETS}
 
 
 if __name__ == "__main__":

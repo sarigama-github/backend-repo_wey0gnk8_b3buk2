@@ -48,17 +48,20 @@ class Order(BaseModel):
     shipping_revenue: float = Field(0, ge=0)
     processing_fees: float = Field(0, ge=0)
     line_items: List[OrderLineItem]
+    market: Optional[str] = Field(None, description="Market/region, e.g., USA, UK, Australia")
 
 class AdSpend(BaseModel):
     date: datetime
     channel: str
     amount: float = Field(..., ge=0)
     kind: Literal["cold", "warm", "brand", "other"] = "cold"
+    market: Optional[str] = Field(None, description="Market/region for spend")
 
 class SubscriptionEvent(BaseModel):
     date: datetime
     amount: float = Field(..., ge=0, description="MRR amount delta for this event")
     event_type: Literal["new", "expansion", "contraction", "churn", "reactivation"]
+    market: Optional[str] = Field(None, description="Market/region for subscription event")
 
 class COGS(BaseModel):
     sku: str
